@@ -1,4 +1,4 @@
-# 3D & 6DoF Streaming — Code Pack (16 sessions)
+# Spatial Media Engineering: From 2D Pixels to 3D Streams (16 sessions)
 
 Hands-on companion code for the 16-session course **"From 3D Basics to 6DoF Streaming"**.
 Sessions 1–10 follow *3D Data Science with Python* (Florent Poux, O'Reilly 2025);
