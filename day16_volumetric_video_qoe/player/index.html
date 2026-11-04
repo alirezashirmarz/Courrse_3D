@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Volumetric Video Player (6DoF + ABR)</title>
+<style>
+  html,body{margin:0;height:100%;background:#0f1218;font-family:system-ui,Segoe UI,Arial,sans-serif;color:#eef}
+  .panel{position:fixed;background:#0f1218d9;padding:12px 14px;border-radius:10px;font-size:14px;line-height:1.55}
+  #hud{left:12px;top:12px;width:330px} #hud b{color:#ffb35c}
+  #ctrl{right:12px;top:12px;width:280px} #chartbox{left:12px;bottom:12px} #help{right:12px;bottom:12px;font-size:13px}
+  select,input,button{font:inherit} button{background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer}
+  .bar{height:10px;background:#2a3040;border-radius:5px;overflow:hidden}.bar>div{height:100%;background:#2a9d8f}
+  #stall{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);font-size:30px;font-weight:700;background:#000a;padding:14px 22px;border-radius:12px;display:none}
+  kbd{background:#2a3040;border-radius:4px;padding:1px 6px} h3{margin:0 0 6px;font-size:17px}
+</style>
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<div id="hud" class="panel">
+  <h3>Volumetric video — QoE</h3>
+  <div>Quality level: <b id="lvl">–</b> (<span id="lvlpts">–</span> pts/frame)</div>
+  <div>Throughput estimate: <b id="thr">–</b></div>
+  <div>Buffer: <b id="buf">0.0 s</b></div><div class="bar"><div id="bufbar" style="width:0%"></div></div>
+  <div>Stalls: <b id="nst">0</b> &nbsp; total stall time: <b id="tst">0.0 s</b></div>
+  <div>Quality switches: <b id="nsw">0</b> &nbsp; avg bitrate: <b id="avgbr">–</b></div>
+  <div>QoE / segment: <b id="qoe">–</b></div>
+</div>
+<div id="ctrl" class="panel">
+  <b>ABR algorithm</b><br>
+  <select id="abr" style="width:100%">
+    <option value="buffer">Buffer-based (BBA)</option>
+    <option value="throughput">Throughput-based</option>
+    <option value="fixed2">Fixed: always HIGH</option>
+    <option value="fixed0">Fixed: always LOW</option>
+  </select>
+  <div style="margin-top:8px"><b>Network</b><br>
+    Bandwidth <span id="bwv">15</span> Mbit/s<br><input id="bw" type="range" min="1" max="50" value="15" style="width:100%"><br>
+    Latency <span id="latv">60</span> ms<br><input id="lat" type="range" min="0" max="400" value="60" style="width:100%"></div>
+  <div style="margin-top:8px"><button id="restart">⟲ Restart session</button></div>
+</div>
+<div id="chartbox" class="panel"><div style="font-size:12px">Last 60 s — <span style="color:#ffb35c">quality level</span>, <span style="color:#5fa8ff">throughput</span>, <span style="color:#2a9d8f">buffer</span>, <span style="color:#ff6b6b">stalls</span></div><canvas id="chart" width="360" height="130"></canvas></div>
+<div id="help" class="panel"><b>Walk around the person (6DoF)</b><br>drag = look, <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move, <kbd>R</kbd>/<kbd>F</kbd> up/down, <kbd>Q</kbd>/<kbd>E</kbd> roll</div>
+<div id="stall">⏳ Buffering…</div>
+<script type="module">
+import * as THREE from 'three';
+const $ = id => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight); document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1d2433);
+scene.add(new THREE.GridHelper(10, 20, 0x556080, 0x343c50));
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.02, 100); camera.rotation.order='YXZ';
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+
+// -------- 6DoF controls
+let pose = {x:0, y:1.2, z:3.2, yaw:0, pitch:-0.08, roll:0}; const keys = {};
+addEventListener('keydown',e=>keys[e.key.toLowerCase()]=true); addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
+let drag=false,lx=0,ly=0;
+renderer.domElement.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;}); addEventListener('pointerup',()=>drag=false);
+addEventListener('pointermove',e=>{if(!drag)return;pose.yaw-=(e.clientX-lx)*0.004;pose.pitch=Math.max(-1.5,Math.min(1.5,pose.pitch-(e.clientY-ly)*0.004));lx=e.clientX;ly=e.clientY;});
+
+// -------- player state
+let M = null;                       // manifest
+let buffer = [];                    // queue of {level, frames:[{pos,col}]}
+let playing = false, stalled = false, nextSeg = 0, downloading = false;
+let frameInSeg = 0, current = null, frameClock = 0;
+let thrEst = null, stats;
+const points = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({size:0.012, vertexColors:true}));
+scene.add(points);
+const SIZE = [0.024, 0.014, 0.009];
+function resetStats(){ stats = {stalls:0, stallTime:0, switches:0, lastLevel:null, rates:[], log:[]}; }
+resetStats();
+
+function bufferSeconds(){ return buffer.length * M.segmentDuration + (current ? (M.fps*M.segmentDuration - frameInSeg)/M.fps : 0); }
+
+// ---------------- ABR algorithms ----------------
+function chooseLevel(){
+  const L = M.levels.length, mode = $('abr').value, B = bufferSeconds();
+  if (mode === 'fixed2') return L-1;
+  if (mode === 'fixed0') return 0;
+  if (mode === 'throughput'){                       // highest bitrate below 80% of measured throughput
+    if (thrEst === null) return 0;
+    let best = 0; M.levels.forEach((lv,i)=>{ if (lv.bitrate <= 0.8*thrEst) best = i; }); return best;
+  }
+  // buffer-based (BBA): reservoir 1.5 s -> lowest, cushion above 4.5 s -> highest, linear in between
+  if (B < 1.5) return 0;
+  if (B > 4.5) return L-1;
+  return Math.min(L-1, Math.floor((B-1.5)/3 * L));
+}
+
+function decodeSegment(buf){
+  const dv = new DataView(buf); let off = 0;
+  const nf = dv.getUint32(off, true); off += 4; const frames = [];
+  for (let f=0; f<nf; f++){
+    const n = dv.getUint32(off, true); off += 4;
+    const q = new Uint16Array(buf.slice(off, off + n*6)); off += n*6;
+    const rgb = new Uint8Array(buf, off, n*3); off += n*3;
+    const pos = new Float32Array(n*3), col = new Float32Array(n*3);
+    for (let i=0;i<n*3;i++){ pos[i] = M.origin[i%3] + q[i]*M.step; col[i] = rgb[i]/255; }
+    frames.push({pos, col});
+  }
+  return frames;
+}
+
+async function downloader(){
+  while (true){
+    if (!M || downloading || bufferSeconds() > 6){ await new Promise(r=>setTimeout(r,50)); continue; }
+    downloading = true;
+    const level = chooseLevel(), t0 = performance.now();
+    try {
+      const r = await fetch(`seg?level=${level}&index=${nextSeg}`); const buf = await r.arrayBuffer();
+      const sec = (performance.now()-t0)/1000, bps = buf.byteLength*8/sec;
+      thrEst = thrEst === null ? bps : 0.7*thrEst + 0.3*bps;
+      buffer.push({level, frames: decodeSegment(buf)}); nextSeg++;
+      if (stats.lastLevel !== null && stats.lastLevel !== level) stats.switches++;
+      stats.lastLevel = level; stats.rates.push(M.levels[level].bitrate);
+    } finally { downloading = false; }
+  }
+}
+
+function showFrame(fr, level){
+  const g = points.geometry;
+  g.setAttribute('position', new THREE.BufferAttribute(fr.pos,3)); g.setAttribute('color', new THREE.BufferAttribute(fr.col,3));
+  g.computeBoundingSphere(); points.material.size = SIZE[level];
+}
+
+// ---------------- playback clock ----------------
+function advance(dt){
+  if (!M) return;
+  if (!playing){ if (bufferSeconds() >= 1.0) playing = true; else return; }   // startup buffer 1 s
+  frameClock += dt;
+  while (frameClock >= 1/M.fps){
+    frameClock -= 1/M.fps;
+    if (!current || frameInSeg >= current.frames.length){
+      if (buffer.length === 0){ if (!stalled){ stalled = true; stats.stalls++; } stats.stallTime += dt; frameClock = 0; return; }
+      current = buffer.shift(); frameInSeg = 0; stalled = false;
+    }
+    showFrame(current.frames[frameInSeg], current.level); frameInSeg++;
+  }
+}
+
+// ---------------- UI ----------------
+let setT=null;
+function pushNet(){ $('bwv').textContent=$('bw').value; $('latv').textContent=$('lat').value; clearTimeout(setT);
+  setT=setTimeout(()=>fetch(`set?kbps=${$('bw').value*1000}&latency_ms=${$('lat').value}`),200); }
+$('bw').oninput=pushNet; $('lat').oninput=pushNet;
+fetch('set').then(r=>r.json()).then(s=>{$('bw').value=Math.round(s.kbps/1000);$('lat').value=Math.round(s.latency_ms);$('bwv').textContent=$('bw').value;$('latv').textContent=$('lat').value;});
+$('restart').onclick=()=>{ buffer=[]; current=null; playing=false; stalled=false; thrEst=null; resetStats(); };
+$('abr').onchange=()=>$('restart').onclick();
+
+const ctx = $('chart').getContext('2d');
+setInterval(()=>{ if(!M) return;
+  stats.log.push({lvl: current ? current.level : -1, thr: thrEst||0, buf: bufferSeconds(), st: stalled});
+  if (stats.log.length > 120) stats.log.shift();
+  ctx.fillStyle='#1b2130'; ctx.fillRect(0,0,360,130);
+  const W=360/120, maxBr = M.levels[M.levels.length-1].bitrate*1.5;
+  stats.log.forEach((p,i)=>{ if(p.st){ctx.fillStyle='#ff6b6b55'; ctx.fillRect(i*W,0,W+0.5,130);} });
+  const line=(f,c)=>{ctx.strokeStyle=c;ctx.lineWidth=2;ctx.beginPath();stats.log.forEach((p,i)=>{const y=f(p);i?ctx.lineTo(i*W,y):ctx.moveTo(i*W,y);});ctx.stroke();};
+  line(p=>125 - Math.min(1,p.thr/maxBr)*115, '#5fa8ff');
+  line(p=>125 - Math.min(1,p.buf/7)*115, '#2a9d8f');
+  line(p=>125 - (p.lvl<0?0:(p.lvl+0.5)/M.levels.length)*115, '#ffb35c');
+}, 500);
+
+let last=performance.now();
+function tick(now){
+  const dt=Math.min(0.1,(now-last)/1000); last=now;
+  const sp=2*dt; if(keys['q'])pose.roll+=dt; if(keys['e'])pose.roll-=dt;
+  const fwd=new THREE.Vector3(-Math.sin(pose.yaw)*Math.cos(pose.pitch),Math.sin(pose.pitch),-Math.cos(pose.yaw)*Math.cos(pose.pitch)), right=new THREE.Vector3(Math.cos(pose.yaw),0,-Math.sin(pose.yaw)), mv=new THREE.Vector3();
+  if(keys['w'])mv.add(fwd); if(keys['s'])mv.sub(fwd); if(keys['d'])mv.add(right); if(keys['a'])mv.sub(right); if(keys['r'])mv.y+=1; if(keys['f'])mv.y-=1;
+  if(mv.lengthSq()>0){mv.normalize().multiplyScalar(sp);pose.x+=mv.x;pose.y+=mv.y;pose.z+=mv.z;}
+  camera.position.set(pose.x,pose.y,pose.z); camera.rotation.set(pose.pitch,pose.yaw,pose.roll);
+  advance(dt);
+  if (M){
+    const lv = current ? current.level : null;
+    $('lvl').textContent = lv===null ? '–' : `${lv} / ${M.levels.length-1}`; $('lvlpts').textContent = lv===null ? '–' : M.levels[lv].points.toLocaleString();
+    $('thr').textContent = thrEst ? (thrEst/1e6).toFixed(1)+' Mbit/s' : '–';
+    const B = bufferSeconds(); $('buf').textContent = B.toFixed(1)+' s'; $('bufbar').style.width = Math.min(100, B/7*100)+'%';
+    $('nst').textContent = stats.stalls; $('tst').textContent = stats.stallTime.toFixed(1)+' s'; $('nsw').textContent = stats.switches;
+    const n = stats.rates.length, sum = stats.rates.reduce((a,b)=>a+b,0);
+    $('avgbr').textContent = n ? (sum/n/1e6).toFixed(1)+' Mbit/s' : '–';
+    // QoE (MPC/Pensieve style): avg bitrate - mu*stall/segment - avg |switch size|, mu = top bitrate
+    let sw=0; for(let i=1;i<n;i++) sw += Math.abs(stats.rates[i]-stats.rates[i-1]);
+    const mu = M.levels[M.levels.length-1].bitrate;
+    $('qoe').textContent = n ? ((sum - mu*stats.stallTime - sw)/n/1e6).toFixed(2) : '–';
+    $('stall').style.display = stalled ? 'block' : 'none';
+  }
+  renderer.render(scene,camera); requestAnimationFrame(tick);
+}
+fetch('manifest.json').then(r=>r.json()).then(m=>{ M=m; downloader(); });
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

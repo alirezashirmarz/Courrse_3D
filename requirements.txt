@@ -1,0 +1,9 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+pillow>=9.0
+open3d>=0.18
+# optional extras used if present:
+# laspy        (Day 04: LAS LiDAR format)
+# DracoPy      (Day 13: compare with Google Draco)
+# scikit-learn (Day 09: DBSCAN fallback if Open3D is missing)

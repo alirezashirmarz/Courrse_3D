@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6DoF Point Cloud Viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#0f1218;font-family:system-ui,Segoe UI,Arial,sans-serif;color:#eef}
+  .panel{position:fixed;background:#0f1218d0;padding:12px 14px;border-radius:10px;font-size:14px;line-height:1.55}
+  #hud{left:12px;top:12px;min-width:300px} #hud b{color:#ffb35c}
+  #help{right:12px;bottom:12px;font-size:13px}
+  #ctrl{right:12px;top:12px}
+  button,input{font:inherit} button{background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer;margin:2px 0}
+  button.rec{background:#d64545} kbd{background:#2a3040;border-radius:4px;padding:1px 6px}
+</style>
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}</script>
+</head>
+<body>
+<div id="hud" class="panel">
+  <div style="font-size:18px;font-weight:700">6DoF viewer</div>
+  <div>Points loaded: <b id="npts">…</b></div>
+  <div>Visible in frustum: <b id="nvis">…</b></div>
+  <div>Position (m): <b id="pos">…</b></div>
+  <div>Yaw / pitch / roll (°): <b id="rot">…</b></div>
+  <div>Quaternion (x,y,z,w): <b id="quat">…</b></div>
+  <div>Frame time: <b id="fps">…</b></div>
+</div>
+<div id="ctrl" class="panel">
+  Point size <input id="psize" type="range" min="0.02" max="0.3" step="0.01" value="0.08"><br>
+  Field of view <input id="fov" type="range" min="30" max="110" step="1" value="70"><br>
+  <button id="rec">● Record pose trace</button><br>
+  <span id="recinfo" style="font-size:12px;opacity:.8">Trace = your 6DoF path, used on Day 16</span>
+</div>
+<div id="help" class="panel">
+  <b>Look</b>: drag mouse &nbsp; <b>Roll</b>: <kbd>Q</kbd>/<kbd>E</kbd><br>
+  <b>Move</b>: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>, up/down <kbd>R</kbd>/<kbd>F</kbd>, fast <kbd>Shift</kbd><br>
+  reset <kbd>0</kbd>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0xcfe3ff);
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.05, 300);
+camera.rotation.order = 'YXZ';
+scene.add(new THREE.AxesHelper(2));   // red = x, green = y (UP in three.js), blue = z
+
+const material = new THREE.PointsMaterial({size:0.08, vertexColors:true, sizeAttenuation:true});
+let cloud = null, positions = null;
+new PLYLoader().load('scene.ply', geo => {
+  cloud = new THREE.Points(geo, material); scene.add(cloud);
+  positions = geo.attributes.position.array;
+  document.getElementById('npts').textContent = (positions.length/3).toLocaleString();
+}, undefined, e => { document.getElementById('npts').textContent = 'scene.ply not found — run frustum_culling.py first'; });
+
+const start = {x:-14, y:1.7, z:14, yaw:-Math.PI/4, pitch:0, roll:0};
+let pose = {...start};
+const keys = {};
+addEventListener('keydown', e=>{ keys[e.key.toLowerCase()] = true; if(e.key==='0') pose={...start}; });
+addEventListener('keyup', e=> keys[e.key.toLowerCase()] = false);
+let drag=false,lx=0,ly=0;
+renderer.domElement.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;});
+addEventListener('pointerup',()=>drag=false);
+addEventListener('pointermove',e=>{ if(!drag) return; pose.yaw-=(e.clientX-lx)*0.004; pose.pitch=Math.max(-1.55,Math.min(1.55,pose.pitch-(e.clientY-ly)*0.004)); lx=e.clientX; ly=e.clientY; });
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+document.getElementById('psize').oninput = e => material.size = +e.target.value;
+document.getElementById('fov').oninput = e => { camera.fov = +e.target.value; camera.updateProjectionMatrix(); };
+
+// ---- pose trace recording (t, position, quaternion) -> CSV
+let recording = false, trace = [], t0 = 0;
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  recording = !recording;
+  if (recording) { trace = []; t0 = performance.now(); recBtn.textContent = '■ Stop & download CSV'; recBtn.className='rec'; }
+  else {
+    recBtn.textContent = '● Record pose trace'; recBtn.className='';
+    const csv = 't_ms,x,y,z,qx,qy,qz,qw,yaw,pitch,roll\n' + trace.map(r=>r.join(',')).join('\n');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    a.download = 'pose_trace.csv'; a.click();
+    document.getElementById('recinfo').textContent = `saved ${trace.length} poses`;
+  }
+};
+
+const frustum = new THREE.Frustum(), pm = new THREE.Matrix4(), v = new THREE.Vector3();
+const $ = id => document.getElementById(id);
+let last = performance.now(), frame = 0, avg = 16;
+function tick(now){
+  const dt = Math.min(0.05,(now-last)/1000); avg = 0.95*avg + 0.05*(now-last); last = now;
+  const sp = (keys['shift']?12:4)*dt;
+  if(keys['q']) pose.roll += 1.2*dt; if(keys['e']) pose.roll -= 1.2*dt;
+  const fwd = new THREE.Vector3(-Math.sin(pose.yaw)*Math.cos(pose.pitch), Math.sin(pose.pitch), -Math.cos(pose.yaw)*Math.cos(pose.pitch));
+  const right = new THREE.Vector3(Math.cos(pose.yaw),0,-Math.sin(pose.yaw));
+  const mv = new THREE.Vector3();
+  if(keys['w']) mv.add(fwd); if(keys['s']) mv.sub(fwd); if(keys['d']) mv.add(right); if(keys['a']) mv.sub(right);
+  if(keys['r']) mv.y += 1; if(keys['f']) mv.y -= 1;
+  if(mv.lengthSq()>0){ mv.normalize().multiplyScalar(sp); pose.x+=mv.x; pose.y+=mv.y; pose.z+=mv.z; }
+  camera.position.set(pose.x,pose.y,pose.z); camera.rotation.set(pose.pitch,pose.yaw,pose.roll);
+  camera.updateMatrixWorld();
+  const q = camera.quaternion;
+  if (recording) trace.push([(now-t0).toFixed(1), pose.x.toFixed(3), pose.y.toFixed(3), pose.z.toFixed(3), q.x.toFixed(5), q.y.toFixed(5), q.z.toFixed(5), q.w.toFixed(5), (pose.yaw*57.2958).toFixed(2), (pose.pitch*57.2958).toFixed(2), (pose.roll*57.2958).toFixed(2)]);
+  // count points inside the frustum every 15 frames (this is what culling would skip)
+  if (positions && frame % 15 === 0) {
+    pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); frustum.setFromProjectionMatrix(pm);
+    let n = 0; for (let i=0;i<positions.length;i+=3){ v.set(positions[i],positions[i+1],positions[i+2]); if(frustum.containsPoint(v)) n++; }
+    $('nvis').textContent = `${n.toLocaleString()} (${(100*n/(positions.length/3)).toFixed(0)}%)`;
+  }
+  $('pos').textContent = `${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}, ${pose.z.toFixed(2)}`;
+  $('rot').textContent = `${(pose.yaw*57.3).toFixed(0)} / ${(pose.pitch*57.3).toFixed(0)} / ${(pose.roll*57.3).toFixed(0)}`;
+  $('quat').textContent = `${q.x.toFixed(2)}, ${q.y.toFixed(2)}, ${q.z.toFixed(2)}, ${q.w.toFixed(2)}`;
+  $('fps').textContent = `${avg.toFixed(1)} ms (${(1000/avg).toFixed(0)} fps)`;
+  renderer.render(scene, camera); frame++; requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

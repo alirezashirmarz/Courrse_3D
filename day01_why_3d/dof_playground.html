@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DoF Playground — 3DoF vs 6DoF</title>
+<style>
+  html,body{margin:0;height:100%;background:#0f1218;font-family:system-ui,Segoe UI,Arial,sans-serif;color:#eef}
+  #hud{position:fixed;left:12px;top:12px;background:#0f1218cc;padding:12px 14px;border-radius:10px;font-size:14px;line-height:1.5;min-width:270px}
+  #hud b{color:#ffb35c} .mode{font-size:20px;font-weight:700}
+  .m3{color:#7fb2ff}.m6{color:#ffb35c}
+  #help{position:fixed;right:12px;bottom:12px;background:#0f1218cc;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.6}
+  #flash{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);font-size:26px;font-weight:700;color:#ff7a7a;opacity:0;transition:opacity .3s}
+  kbd{background:#2a3040;border-radius:4px;padding:1px 6px}
+</style>
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<div id="hud">
+  <div class="mode" id="mode">6DoF</div>
+  <div>Position (m) &nbsp; x <b id="px">0</b> &nbsp; y <b id="py">0</b> &nbsp; z <b id="pz">0</b></div>
+  <div>Rotation (°) &nbsp; yaw <b id="yw">0</b> &nbsp; pitch <b id="pt">0</b> &nbsp; roll <b id="rl">0</b></div>
+  <div style="opacity:.75;font-size:12px">6 numbers = one 6DoF pose. (three.js uses Y as "up")</div>
+</div>
+<div id="help">
+  <b>Look</b>: drag mouse &nbsp;·&nbsp; <b>Roll</b>: <kbd>Q</kbd>/<kbd>E</kbd><br>
+  <b>Move</b>: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> &nbsp; up/down <kbd>R</kbd>/<kbd>F</kbd><br>
+  <b>Toggle 3DoF / 6DoF</b>: <kbd>M</kbd> &nbsp;·&nbsp; reset <kbd>0</kbd>
+</div>
+<div id="flash">Translation locked in 3DoF!</div>
+<script type="module">
+import * as THREE from 'three';
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0xcfe3ff);
+scene.fog = new THREE.Fog(0xcfe3ff, 30, 90);
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.05, 200);
+camera.rotation.order = 'YXZ';   // yaw (Y) -> pitch (X) -> roll (Z)
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x556655, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2); sun.position.set(10,20,8); scene.add(sun);
+
+// ---- a little world: ground grid, a house, trees, a ball, pillars at different depths
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(200,200), new THREE.MeshLambertMaterial({color:0x7a8a6a}));
+ground.rotation.x = -Math.PI/2; scene.add(ground);
+scene.add(new THREE.GridHelper(200, 100, 0x445544, 0x667766));
+function box(w,h,d,color,x,y,z){const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshLambertMaterial({color}));m.position.set(x,y,z);scene.add(m);return m;}
+box(6,3,4,0xe0d4bc,0,1.5,-12);                       // house walls
+const roof = new THREE.Mesh(new THREE.ConeGeometry(4.4,1.8,4), new THREE.MeshLambertMaterial({color:0xb03a2e}));
+roof.position.set(0,3.9,-12); roof.rotation.y=Math.PI/4; roof.scale.set(1.05,1,0.75); scene.add(roof);
+box(1,2,0.1,0x5a3a20,0,1,-9.95);
+function tree(x,z){box(0.3,2,0.3,0x6b4423,x,1,z);const s=new THREE.Mesh(new THREE.SphereGeometry(1.2,20,16),new THREE.MeshLambertMaterial({color:0x2f8a3a}));s.position.set(x,2.9,z);scene.add(s);}
+tree(-3,-4); tree(4,-7); tree(-7,-14); tree(8,-16);
+const ball = new THREE.Mesh(new THREE.SphereGeometry(0.6,32,24), new THREE.MeshStandardMaterial({color:0xff7a1a, roughness:.4}));
+ball.position.set(1.5,0.6,-3); scene.add(ball);
+for(let i=0;i<8;i++) box(0.4,2.5,0.4, i%2?0x3b6fe0:0xf08a24, -6+i*1.7, 1.25, -1-i*3);
+
+// ---- pose state
+const start = {x:0,y:1.7,z:4,yaw:0,pitch:0,roll:0};
+let pose = {...start}; let sixDof = true;
+const keys = {};
+addEventListener('keydown', e=>{keys[e.key.toLowerCase()]=true;
+  if(e.key.toLowerCase()==='m'){sixDof=!sixDof; if(!sixDof){pose.x=start.x;pose.y=start.y;pose.z=start.z;}}
+  if(e.key==='0'){pose={...start};}});
+addEventListener('keyup', e=>keys[e.key.toLowerCase()]=false);
+let drag=false,lx=0,ly=0;
+renderer.domElement.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;});
+addEventListener('pointerup',()=>drag=false);
+addEventListener('pointermove',e=>{if(!drag)return;pose.yaw-=(e.clientX-lx)*0.004;pose.pitch-=(e.clientY-ly)*0.004;
+  pose.pitch=Math.max(-1.5,Math.min(1.5,pose.pitch));lx=e.clientX;ly=e.clientY;});
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+
+const flash=document.getElementById('flash'); let flashT=0;
+const $=id=>document.getElementById(id);
+let last=performance.now();
+function tick(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  const sp=4*dt, rs=1.2*dt;
+  if(keys['q']) pose.roll+=rs; if(keys['e']) pose.roll-=rs;
+  const fwd=new THREE.Vector3(-Math.sin(pose.yaw),0,-Math.cos(pose.yaw)), right=new THREE.Vector3(Math.cos(pose.yaw),0,-Math.sin(pose.yaw));
+  let mv=new THREE.Vector3();
+  if(keys['w']) mv.add(fwd); if(keys['s']) mv.sub(fwd); if(keys['d']) mv.add(right); if(keys['a']) mv.sub(right);
+  if(keys['r']) mv.y+=1; if(keys['f']) mv.y-=1;
+  if(mv.lengthSq()>0){ if(sixDof){mv.normalize().multiplyScalar(sp);pose.x+=mv.x;pose.y=Math.max(0.2,pose.y+mv.y);pose.z+=mv.z;} else flashT=now; }
+  flash.style.opacity = (now-flashT<700)?1:0;
+  camera.position.set(pose.x,pose.y,pose.z); camera.rotation.set(pose.pitch,pose.yaw,pose.roll);
+  const m=$('mode'); m.textContent=sixDof?'6DoF  (rotate + move)':'3DoF  (rotate only — like 360° video)'; m.className='mode '+(sixDof?'m6':'m3');
+  $('px').textContent=pose.x.toFixed(2);$('py').textContent=pose.y.toFixed(2);$('pz').textContent=pose.z.toFixed(2);
+  $('yw').textContent=(pose.yaw*57.3).toFixed(0);$('pt').textContent=(pose.pitch*57.3).toFixed(0);$('rl').textContent=(pose.roll*57.3).toFixed(0);
+  renderer.render(scene,camera); requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
